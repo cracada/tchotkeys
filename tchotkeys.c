@@ -72,6 +72,23 @@ static void normalizeOem(char* s) {
         replaceAll(s, map[i].from, map[i].to);
 }
 
+/* 按 Tab 或连续 2+ 空格分列；快捷键里的 " + " 是单空格，不受影响 */
+static int splitFields(char* line, char* fld[], int maxf) {
+    int nf = 0;
+    char* s = line;
+    while (nf < maxf) {
+        while (*s == ' ' || *s == '\t') s++;
+        if (!*s) break;
+        fld[nf++] = s;
+        char* p = s;
+        while (*p && *p != '\t' && !(*p == ' ' && *(p + 1) == ' ')) p++;
+        if (!*p) break;
+        *p = 0;
+        s = p + 1;
+    }
+    return nf;
+}
+
 static void parseText(char* text) {
     g_count = 0;
     char* line = text;
@@ -80,23 +97,32 @@ static void parseText(char* text) {
         if (nl) *nl = 0;
         char* L = line;
         if (*L && !strstr(L, "=====") && !strstr(L, "命令")) {
-            char* fld[5] = {0}; int nf = 0; char* s = L;
-            while (nf < 5) {
-                fld[nf++] = s;
-                char* t = strchr(s, '\t');
-                if (!t) break;
-                *t = 0; s = t + 1;
-            }
+            char* fld[5] = {0};
+            int nf = splitFields(L, fld, 5);
             while (nf < 5) fld[nf++] = (char*)"";
             for (int i = 0; i < 5; i++) trimRight(fld[i]);
+
             const char* cmd = fld[0];
             const char* def = fld[2];
             const char* cur = fld[3];
+
             int hasDef = *def && strcmp(def, "---") != 0;
             int hasCur = *cur && strcmp(cur, "---") != 0;
-            if (*cmd && (hasDef || hasCur)) {
+            int defMarked = hasDef && strstr(def, "(*)") != NULL;
+
+            /* 三层判断：
+               cur 有效           -> 用 cur
+               cur 为空, def 未标记 -> 用 def
+               cur 为空, def 带(*)  -> 快捷键已被取消，丢弃 */
+            const char* hk = NULL;
+            if (hasCur)
+                hk = cur;
+            else if (hasDef && !defMarked)
+                hk = def;
+
+            if (*cmd && hk) {
                 strncpy(g_rows[g_count].cmd, cmd, MAX_LEN-1);
-                strncpy(g_rows[g_count].hotkey, hasCur ? cur : def, MAX_LEN-1);
+                strncpy(g_rows[g_count].hotkey, hk, MAX_LEN-1);
                 g_rows[g_count].cmd[MAX_LEN-1] = 0;
                 g_rows[g_count].hotkey[MAX_LEN-1] = 0;
                 stripMark(g_rows[g_count].hotkey);
