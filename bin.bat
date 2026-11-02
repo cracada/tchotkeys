@@ -1,0 +1,1 @@
+gcc -O2 -s -mwindows -finput-charset=UTF-8 -fexec-charset=GBK -o tchotkeys.exe tchotkeys.c -lcomctl32
