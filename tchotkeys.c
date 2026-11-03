@@ -8,10 +8,13 @@
 
 #define MAX_ROWS 4096
 #define MAX_LEN  512
+#define MAX_PARTS 32
 
 typedef struct {
+    char desc[MAX_LEN];
     char cmd[MAX_LEN];
     char hotkey[MAX_LEN];
+    int  srcLine;
 } Row;
 
 static Row  g_rows[MAX_ROWS];
@@ -21,6 +24,8 @@ static HFONT g_listFont = NULL;
 static char g_filter[64] = {0};
 static int  g_filterActive = 0;
 static int  g_isSymbol = 0;
+static int  g_executing = 0;
+static int  g_allowExec = 0;      /* 默认安全模式：Enter 只复制 */
 
 /* ================= 文件读取 / 解析 ================= */
 
@@ -72,64 +77,115 @@ static void normalizeOem(char* s) {
         replaceAll(s, map[i].from, map[i].to);
 }
 
-/* 按 Tab 或连续 2+ 空格分列；快捷键里的 " + " 是单空格，不受影响 */
-static int splitFields(char* line, char* fld[], int maxf) {
+static int splitTab(char* line, char* fld[], int maxf) {
     int nf = 0;
     char* s = line;
     while (nf < maxf) {
-        while (*s == ' ' || *s == '\t') s++;
-        if (!*s) break;
         fld[nf++] = s;
-        char* p = s;
-        while (*p && *p != '\t' && !(*p == ' ' && *(p + 1) == ' ')) p++;
-        if (!*p) break;
-        *p = 0;
-        s = p + 1;
+        char* t = strchr(s, '\t');
+        if (!t) break;
+        *t = 0;
+        s = t + 1;
     }
     return nf;
+}
+
+static int splitEq(char* s, char* parts[], int maxp) {
+    int n = 0;
+    char* p = s;
+    while (n < maxp) {
+        parts[n++] = p;
+        char* eq = strstr(p, " = ");
+        if (!eq) break;
+        *eq = 0;
+        p = eq + 3;
+    }
+    return n;
+}
+
+static void addHotkey(char* raw, char processed[][MAX_LEN], int* nproc) {
+    char tmp[MAX_LEN];
+    strncpy(tmp, raw, MAX_LEN-1);
+    tmp[MAX_LEN-1] = 0;
+    trimRight(tmp);
+    char* t = tmp;
+    while (*t == ' ') t++;
+    if (!*t) return;
+    if (strstr(t, "(*)")) return;
+    stripMark(t);
+    normalizeOem(t);
+    for (int m = 0; m < *nproc; m++)
+        if (strcmp(processed[m], t) == 0) return;
+    if (*nproc < MAX_PARTS) {
+        strncpy(processed[*nproc], t, MAX_LEN-1);
+        processed[*nproc][MAX_LEN-1] = 0;
+        (*nproc)++;
+    }
 }
 
 static void parseText(char* text) {
     g_count = 0;
     char* line = text;
+    int srcLine = 0;
+
     while (line && *line && g_count < MAX_ROWS) {
         char* nl = strchr(line, '\n');
         if (nl) *nl = 0;
         char* L = line;
-        if (*L && !strstr(L, "=====") && !strstr(L, "命令")) {
-            char* fld[5] = {0};
-            int nf = splitFields(L, fld, 5);
-            while (nf < 5) fld[nf++] = (char*)"";
-            for (int i = 0; i < 5; i++) trimRight(fld[i]);
 
-            const char* cmd = fld[0];
-            const char* def = fld[2];
-            const char* cur = fld[3];
+        if (*L && !strstr(L, "=====")) {
+            char* fld[4] = {0};
+            int nf = splitTab(L, fld, 4);
+            while (nf < 4) fld[nf++] = (char*)"";
+            for (int i = 0; i < 4; i++) trimRight(fld[i]);
 
-            int hasDef = *def && strcmp(def, "---") != 0;
-            int hasCur = *cur && strcmp(cur, "---") != 0;
-            int defMarked = hasDef && strstr(def, "(*)") != NULL;
+            if (strcmp(fld[0], "描述") == 0 && strcmp(fld[1], "命令") == 0) {
+                srcLine++;
+                if (!nl) break;
+                line = nl + 1;
+                continue;
+            }
 
-            /* 三层判断：
-               cur 有效           -> 用 cur
-               cur 为空, def 未标记 -> 用 def
-               cur 为空, def 带(*)  -> 快捷键已被取消，丢弃 */
-            const char* hk = NULL;
-            if (hasCur)
-                hk = cur;
-            else if (hasDef && !defMarked)
-                hk = def;
+            const char* cmd = fld[1];
+            if (*cmd) {
+                char descBuf[MAX_LEN];
+                strncpy(descBuf, fld[0], MAX_LEN-1);
+                descBuf[MAX_LEN-1] = 0;
+                int dl = (int)strlen(descBuf);
+                if (dl >= 1 && descBuf[0] == '"' && descBuf[dl-1] != '"')
+                    memmove(descBuf, descBuf+1, dl);
 
-            if (*cmd && hk) {
-                strncpy(g_rows[g_count].cmd, cmd, MAX_LEN-1);
-                strncpy(g_rows[g_count].hotkey, hk, MAX_LEN-1);
-                g_rows[g_count].cmd[MAX_LEN-1] = 0;
-                g_rows[g_count].hotkey[MAX_LEN-1] = 0;
-                stripMark(g_rows[g_count].hotkey);
-                normalizeOem(g_rows[g_count].hotkey);
-                g_count++;
+                char curBuf[MAX_LEN], defBuf[MAX_LEN];
+                strncpy(curBuf, fld[3], MAX_LEN-1); curBuf[MAX_LEN-1] = 0;
+                strncpy(defBuf, fld[2], MAX_LEN-1); defBuf[MAX_LEN-1] = 0;
+
+                char processed[MAX_PARTS][MAX_LEN];
+                int nproc = 0;
+                char* parts[MAX_PARTS];
+                int np, k;
+
+                if (curBuf[0] && strcmp(curBuf, "---") != 0) {
+                    np = splitEq(curBuf, parts, MAX_PARTS);
+                    for (k = 0; k < np; k++) addHotkey(parts[k], processed, &nproc);
+                }
+                if (defBuf[0] && strcmp(defBuf, "---") != 0) {
+                    np = splitEq(defBuf, parts, MAX_PARTS);
+                    for (k = 0; k < np; k++) addHotkey(parts[k], processed, &nproc);
+                }
+
+                for (k = 0; k < nproc && g_count < MAX_ROWS; k++) {
+                    strncpy(g_rows[g_count].desc,   descBuf,      MAX_LEN-1);
+                    strncpy(g_rows[g_count].cmd,    cmd,          MAX_LEN-1);
+                    strncpy(g_rows[g_count].hotkey, processed[k], MAX_LEN-1);
+                    g_rows[g_count].desc[MAX_LEN-1]   = 0;
+                    g_rows[g_count].cmd[MAX_LEN-1]    = 0;
+                    g_rows[g_count].hotkey[MAX_LEN-1] = 0;
+                    g_rows[g_count].srcLine = srcLine;
+                    g_count++;
+                }
             }
         }
+        srcLine++;
         if (!nl) break;
         line = nl + 1;
     }
@@ -217,7 +273,103 @@ static int vkToKeyStr(WPARAM vk, char* out, int outSize) {
     return 0;
 }
 
-/* ================= 复制 / 执行（走 tcmc） ================= */
+/* ================= 热键字符串 → 虚拟键码 ================= */
+
+typedef struct { int ctrl, shift, alt, win; WORD vk; } HotkeyDef;
+
+static WORD keyNameToVK(const char* name) {
+    size_t len = strlen(name);
+    if (len == 1) {
+        char c = name[0];
+        if (c >= 'A' && c <= 'Z') return (WORD)c;
+        if (c >= 'a' && c <= 'z') return (WORD)(c - 32);
+        if (c >= '0' && c <= '9') return (WORD)c;
+        switch (c) {
+        case '[':  return VK_OEM_4;
+        case ']':  return VK_OEM_6;
+        case '\\': return VK_OEM_5;
+        case ';':  return VK_OEM_1;
+        case '\'': return VK_OEM_7;
+        case ',':  return VK_OEM_COMMA;
+        case '.':  return VK_OEM_PERIOD;
+        case '/':  return VK_OEM_2;
+        case '`':  return VK_OEM_3;
+        case '-':  return VK_OEM_MINUS;
+        case '=':  return VK_OEM_PLUS;
+        case '+':  return VK_OEM_PLUS;
+        case '*':  return VK_MULTIPLY;
+        }
+    }
+    if (len >= 2 && (name[0] == 'F' || name[0] == 'f')) {
+        int num = atoi(name + 1);
+        if (num >= 1 && num <= 24) return (WORD)(VK_F1 + num - 1);
+    }
+    if (strncmp(name, "Num ", 4) == 0) {
+        const char* k = name + 4;
+        if (strcmp(k, "+") == 0) return VK_ADD;
+        if (strcmp(k, "-") == 0) return VK_SUBTRACT;
+        if (strcmp(k, "*") == 0) return VK_MULTIPLY;
+        if (strcmp(k, "/") == 0) return VK_DIVIDE;
+    }
+    static const struct { const char* name; WORD vk; } map[] = {
+        {"Back", VK_BACK}, {"Tab", VK_TAB}, {"Enter", VK_RETURN},
+        {"Space", VK_SPACE}, {"Esc", VK_ESCAPE}, {"Escape", VK_ESCAPE},
+        {"Left", VK_LEFT}, {"Right", VK_RIGHT}, {"Up", VK_UP}, {"Down", VK_DOWN},
+        {"Home", VK_HOME}, {"End", VK_END},
+        {"PgUp", VK_PRIOR}, {"PgDn", VK_NEXT},
+        {"Ins", VK_INSERT}, {"Del", VK_DELETE},
+    };
+    for (int i = 0; i < (int)(sizeof(map)/sizeof(map[0])); i++)
+        if (strcmp(name, map[i].name) == 0) return map[i].vk;
+    return 0;
+}
+
+static int parseHotkey(const char* hk, HotkeyDef* out) {
+    char buf[MAX_LEN];
+    strncpy(buf, hk, MAX_LEN-1); buf[MAX_LEN-1] = 0;
+    int len = (int)strlen(buf);
+    while (len > 0 && buf[len-1] == ' ') buf[--len] = 0;
+
+    out->ctrl = out->shift = out->alt = out->win = 0;
+    out->vk = 0;
+
+    char* p = buf;
+    while (*p) {
+        if      (strncmp(p, "Ctrl + ",  7) == 0) { out->ctrl = 1;  p += 7; }
+        else if (strncmp(p, "Shift + ", 8) == 0) { out->shift = 1; p += 8; }
+        else if (strncmp(p, "Alt + ",   6) == 0) { out->alt = 1;   p += 6; }
+        else if (strncmp(p, "Win + ",   6) == 0) { out->win = 1;   p += 6; }
+        else break;
+    }
+    if (!*p) return 0;
+    out->vk = keyNameToVK(p);
+    return out->vk != 0;
+}
+
+/* ================= 模拟按键 ================= */
+
+static void sendHotkey(const HotkeyDef* hk) {
+    INPUT in[10];
+    int n = 0;
+    ZeroMemory(in, sizeof(in));
+
+    if (hk->ctrl)  { in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_LCONTROL; n++; }
+    if (hk->shift) { in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_LSHIFT;   n++; }
+    if (hk->alt)   { in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_LMENU;    n++; }
+    if (hk->win)   { in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_LWIN;     n++; }
+
+    in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = hk->vk; in[n].ki.dwFlags = 0; n++;
+    in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = hk->vk; in[n].ki.dwFlags = KEYEVENTF_KEYUP; n++;
+
+    if (hk->win)   { in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_LWIN;     in[n].ki.dwFlags = KEYEVENTF_KEYUP; n++; }
+    if (hk->alt)   { in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_LMENU;    in[n].ki.dwFlags = KEYEVENTF_KEYUP; n++; }
+    if (hk->shift) { in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_LSHIFT;   in[n].ki.dwFlags = KEYEVENTF_KEYUP; n++; }
+    if (hk->ctrl)  { in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_LCONTROL; in[n].ki.dwFlags = KEYEVENTF_KEYUP; n++; }
+
+    SendInput(n, in, sizeof(INPUT));
+}
+
+/* ================= 复制 / 执行 ================= */
 
 static void copyToClipboard(HWND hwnd, const char* text) {
     if (!OpenClipboard(hwnd)) return;
@@ -248,57 +400,40 @@ static void copySelectionAndClose(void) {
     DestroyWindow(g_main);
 }
 
-/* 找 tcmc.exe：优先本程序同目录，找不到就交给 PATH */
-static void buildTcmcPath(char* out, int size) {
-    GetModuleFileNameA(NULL, out, size);
-    char* slash = strrchr(out, '\\');
-    if (slash) *(slash + 1) = 0;
-    strncat(out, "tcmc.exe", size - strlen(out) - 1);
-    if (GetFileAttributesA(out) == INVALID_FILE_ATTRIBUTES)
-        strcpy(out, "tcmc.exe");
-}
-
 static void executeSelection(void) {
     int idx = getSelectedRow();
     if (idx < 0) return;
-    Row* r = &g_rows[idx];
 
-    HWND tc = FindWindowA("TTOTAL_CMD", NULL);
-    if (tc) {
-        if (IsIconic(tc)) ShowWindow(tc, SW_RESTORE);
-        SetForegroundWindow(tc);
+    /* 安全模式：不执行，退化为复制命令名 */
+    if (!g_allowExec) {
+        copyToClipboard(g_main, g_rows[idx].cmd);
+        DestroyWindow(g_main);
+        return;
     }
 
-    char tcmc[MAX_PATH];
-    buildTcmcPath(tcmc, sizeof(tcmc));
-
-    /* em_XXX -> emem_XXX    cm_XXX -> cmcm_XXX    其他原样传 */
-    char arg[MAX_LEN + 8];
-    if (strncmp(r->cmd, "em_", 3) == 0)
-        snprintf(arg, sizeof(arg), "em%s", r->cmd);
-    else if (strncmp(r->cmd, "cm_", 3) == 0)
-        snprintf(arg, sizeof(arg), "cm%s", r->cmd);
-    else
-        snprintf(arg, sizeof(arg), "%s", r->cmd);
-
-    char cmdLine[MAX_PATH + MAX_LEN + 16];
-    snprintf(cmdLine, sizeof(cmdLine), "\"%s\" %s", tcmc, arg);
-
-    STARTUPINFOA si = { sizeof(si) };
-    PROCESS_INFORMATION pi = {0};
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-
-    if (!CreateProcessA(NULL, cmdLine, NULL, NULL, FALSE,
-                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    HotkeyDef hk;
+    if (!parseHotkey(g_rows[idx].hotkey, &hk)) {
         MessageBoxA(g_main,
-            "无法启动 tcmc.exe\n\n"
-            "请把 tcmc.exe 放在本程序同目录，或加入 PATH。",
+            "无法解析该热键，请手动在 TC 中按下对应组合键。",
             "TC 快捷键速查", MB_ICONWARNING);
         return;
     }
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
+
+    HWND tc = FindWindowA("TTOTAL_CMD", NULL);
+    if (!tc) {
+        MessageBoxA(g_main, "未找到 Total Commander 主窗口。",
+                    "TC 快捷键速查", MB_ICONWARNING);
+        return;
+    }
+
+    g_executing = 1;
+    ShowWindow(g_main, SW_HIDE);
+
+    if (IsIconic(tc)) ShowWindow(tc, SW_RESTORE);
+    SetForegroundWindow(tc);
+    Sleep(60);
+
+    sendHotkey(&hk);
 
     DestroyWindow(g_main);
 }
@@ -308,22 +443,35 @@ static void executeSelection(void) {
 static void refreshList(void) {
     ListView_DeleteAllItems(g_list);
     int idx = 0;
+    int lastSrcLine = -1;
+
     for (int i = 0; i < g_count; i++) {
         if (!matchHotkey(g_rows[i].hotkey, g_filter, g_isSymbol)) continue;
+
         LVITEMA lvi = {0};
         lvi.mask = LVIF_TEXT | LVIF_PARAM;
         lvi.iItem = idx;
-        lvi.pszText = g_rows[i].cmd;
+        lvi.pszText = "";
         lvi.lParam = (LPARAM)i;
         int item = (int)SendMessageA(g_list, LVM_INSERTITEMA, 0, (LPARAM)&lvi);
-        ListView_SetItemText(g_list, item, 1, g_rows[i].hotkey);
+
+        if (g_rows[i].srcLine != lastSrcLine) {
+            ListView_SetItemText(g_list, item, 0, g_rows[i].desc);
+            lastSrcLine = g_rows[i].srcLine;
+        } else {
+            ListView_SetItemText(g_list, item, 0, "");
+        }
+        ListView_SetItemText(g_list, item, 1, g_rows[i].cmd);
+        ListView_SetItemText(g_list, item, 2, g_rows[i].hotkey);
         idx++;
     }
+
     char status[MAX_LEN * 2];
+    const char* enterTip = g_allowExec ? "Enter 执行" : "Enter 复制";
     if (g_filterActive && g_filter[0])
-        sprintf(status, "过滤: %s   Enter 执行  双击复制", g_filter);
+        sprintf(status, "过滤: %s   %s   方向键等特殊键加按Ctrl进行匹配   双击复制命令", g_filter, enterTip);
     else
-        sprintf(status, "共 %d 条   按键过滤   Enter 执行  双击复制", g_count);
+        sprintf(status, "共 %d 条   按键过滤   %s   方向键等特殊键加按Ctrl进行匹配   双击复制命令", g_count, enterTip);
     SetWindowTextA(g_status, status);
     sprintf(status, "TC 快捷键速查 - 匹配 %d / %d", idx, g_count);
     SetWindowTextA(g_main, status);
@@ -386,15 +534,19 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         {
             LVCOLUMNA c = {0};
             c.mask = LVCF_TEXT | LVCF_WIDTH;
-            c.pszText = "命令"; c.cx = 280; SendMessage(g_list, LVM_INSERTCOLUMNA, 0, (LPARAM)&c);
-            c.pszText = "热键"; c.cx = 300; SendMessage(g_list, LVM_INSERTCOLUMNA, 1, (LPARAM)&c);
+            c.pszText = "描述"; c.cx = 320; SendMessage(g_list, LVM_INSERTCOLUMNA, 0, (LPARAM)&c);
+            c.pszText = "命令"; c.cx = 240; SendMessage(g_list, LVM_INSERTCOLUMNA, 1, (LPARAM)&c);
+            c.pszText = "热键"; c.cx = 220; SendMessage(g_list, LVM_INSERTCOLUMNA, 2, (LPARAM)&c);
         }
         refreshList();
         return 0;
 
     case WM_ACTIVATE:
-        if (LOWORD(w) == WA_INACTIVE) PostMessage(h, WM_CLOSE, 0, 0);
-        else SetFocus(g_list);
+        if (LOWORD(w) == WA_INACTIVE) {
+            if (!g_executing) PostMessage(h, WM_CLOSE, 0, 0);
+        } else {
+            SetFocus(g_list);
+        }
         return 0;
 
     case WM_SYSKEYDOWN:
@@ -410,7 +562,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
 
     case WM_GETMINMAXINFO:
-        ((MINMAXINFO*)l)->ptMinTrackSize.x = 400;
+        ((MINMAXINFO*)l)->ptMinTrackSize.x = 480;
         ((MINMAXINFO*)l)->ptMinTrackSize.y = 260;
         return 0;
 
@@ -432,14 +584,32 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_LISTVIEW_CLASSES };
     InitCommonControlsEx(&icc);
 
+    /* 解析命令行：--exec 启用执行模式，其余参数视为文件路径 */
     char path[MAX_PATH] = {0};
     if (lpCmd && *lpCmd) {
-        const char* p = lpCmd;
-        if (*p == '"') p++;
-        int i = 0;
-        while (*p && *p != '"' && i < MAX_PATH - 1) path[i++] = *p++;
-        path[i] = 0;
-    } else {
+        char* tok = lpCmd;
+        while (*tok) {
+            while (*tok == ' ') tok++;
+            if (!*tok) break;
+            char* end = tok;
+            int quoted = 0;
+            if (*tok == '"') { quoted = 1; tok++; end = tok; while (*end && *end != '"') end++; }
+            else { while (*end && *end != ' ') end++; }
+
+            if (!quoted && strncmp(tok, "--exec", 6) == 0) {
+                g_allowExec = 1;
+            } else if (*tok) {
+                int n = (int)(end - tok);
+                if (n > 0 && n < MAX_PATH) {
+                    memcpy(path, tok, n);
+                    path[n] = 0;
+                }
+            }
+            if (*end) end++;
+            tok = end;
+        }
+    }
+    if (!path[0]) {
         GetModuleFileNameA(NULL, path, MAX_PATH);
         char* slash = strrchr(path, '\\');
         if (slash) *(slash + 1) = 0;
@@ -468,7 +638,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
 
     int sw = GetSystemMetrics(SM_CXSCREEN);
     int sh = GetSystemMetrics(SM_CYSCREEN);
-    int ww = 640, wh = 420;
+    int ww = 800, wh = 420;
     int x = (sw - ww) / 2;
     int y = (sh - wh) / 2;
 
