@@ -1,0 +1,8 @@
+[Shortcuts]
+A+1=em_open1bar
+A+2=em_open2bar
+A+3=em_open3bar
+A+4=em_open4bar
+A+5=em_open5bar
+A+6=em_open6bar
+A+M=em_openMbar
